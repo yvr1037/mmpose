@@ -132,7 +132,7 @@ class WindowMSA(BaseModule):
                 -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(
             2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn  # + relative_position_bias.unsqueeze(0)
+        attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
             nW = mask.shape[0]
