@@ -4,10 +4,11 @@ import math
 
 import torch
 import torch.nn as nn
-from mmcv.cnn import build_activation_layer, build_conv_layer, build_norm_layer
+# from timm.models.layers import to_2tuple, trunc_normal_
+from mmcv.cnn import (build_activation_layer, build_conv_layer,
+                      build_norm_layer, trunc_normal_init)
 from mmcv.cnn.bricks.transformer import build_dropout
 from mmcv.runner import BaseModule
-from timm.models.layers import to_2tuple, trunc_normal_
 from torch.nn.functional import pad
 
 from ..builder import BACKBONES
@@ -105,7 +106,7 @@ class WindowMSA(BaseModule):
         self.softmax = nn.Softmax(dim=-1)
 
     def init_weights(self):
-        trunc_normal_(self.relative_position_bias_table, std=0.02)
+        trunc_normal_init(self.relative_position_bias_table, std=0.02)
 
     def forward(self, x, mask=None):
         """
@@ -181,7 +182,7 @@ class LocalWindowSelfAttention(BaseModule):
         self.attn = WindowMSA(
             embed_dims=embed_dims,
             num_heads=num_heads,
-            window_size=to_2tuple(window_size),
+            window_size=(window_size, window_size),
             qkv_bias=qkv_bias,
             qk_scale=qk_scale,
             attn_drop_rate=attn_drop_rate,
@@ -202,14 +203,17 @@ class LocalWindowSelfAttention(BaseModule):
 
         # permute
         x = x.view(B, math.ceil(H / Wh), Wh, math.ceil(W / Ww), Ww, C)
-        x = x.permute(2, 4, 0, 1, 3, 5)
-        x = x.reshape(Wh * Ww, -1, C)
+        x = x.permute(1, 3, 0, 2, 4, 5)
+        x = x.reshape(-1, Wh * Ww, C)
+        # x = x.permute(2, 4, 0, 1, 3, 5)
+        # x = x.reshape(Wh * Ww, -1, C)
 
         # attention
-        out = self.attn(x, x, x, **kwargs)
+        # out = self.attn(x, x, x, **kwargs)
+        out = self.attn(x, **kwargs)
 
         # reverse permutation
-        out = out.reshape(Wh, Ww, B, math.ceil(H / Wh), math.ceil(W / Ww), C)
+        out = out.reshape(math.ceil(H / Wh), math.ceil(W / Ww), B, Wh, Ww, C)
         out = out.permute(2, 0, 3, 1, 4, 5)
         out = out.reshape(B, H + pad_h, W + pad_w, C)
 
