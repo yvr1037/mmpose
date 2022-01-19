@@ -77,6 +77,7 @@ class WindowMSA(BaseModule):
                  qk_scale=None,
                  attn_drop_rate=0.,
                  proj_drop_rate=0.,
+                 with_rpe=True,
                  init_cfg=None):
 
         super().__init__(init_cfg=init_cfg)
@@ -86,17 +87,20 @@ class WindowMSA(BaseModule):
         head_embed_dims = embed_dims // num_heads
         self.scale = qk_scale or head_embed_dims**-0.5
 
-        # define a parameter table of relative position bias
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1),
-                        num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+        self.with_rpe = with_rpe
+        if self.with_rpe:
+            # define a parameter table of relative position bias
+            self.relative_position_bias_table = nn.Parameter(
+                torch.zeros(
+                    (2 * window_size[0] - 1) * (2 * window_size[1] - 1),
+                    num_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
-        # About 2x faster than original impl
-        Wh, Ww = self.window_size
-        rel_index_coords = self.double_step_seq(2 * Ww - 1, Wh, 1, Ww)
-        rel_position_index = rel_index_coords + rel_index_coords.T
-        rel_position_index = rel_position_index.flip(1).contiguous()
-        self.register_buffer('relative_position_index', rel_position_index)
+            # About 2x faster than original impl
+            Wh, Ww = self.window_size
+            rel_index_coords = self.double_step_seq(2 * Ww - 1, Wh, 1, Ww)
+            rel_position_index = rel_index_coords + rel_index_coords.T
+            rel_position_index = rel_position_index.flip(1).contiguous()
+            self.register_buffer('relative_position_index', rel_position_index)
 
         self.qkv = nn.Linear(embed_dims, embed_dims * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop_rate)
@@ -125,14 +129,15 @@ class WindowMSA(BaseModule):
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
 
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)].view(
-                self.window_size[0] * self.window_size[1],
-                self.window_size[0] * self.window_size[1],
-                -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(
-            2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
+        if self.with_rpe:
+            relative_position_bias = self.relative_position_bias_table[
+                self.relative_position_index.view(-1)].view(
+                    self.window_size[0] * self.window_size[1],
+                    self.window_size[0] * self.window_size[1],
+                    -1)  # Wh*Ww,Wh*Ww,nH
+            relative_position_bias = relative_position_bias.permute(
+                2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+            attn = attn + relative_position_bias.unsqueeze(0)
 
         if mask is not None:
             nW = mask.shape[0]
@@ -175,6 +180,7 @@ class LocalWindowSelfAttention(BaseModule):
                  qk_scale=None,
                  attn_drop_rate=0.,
                  proj_drop_rate=0.,
+                 with_rpe=True,
                  init_cfg=None):
         super(LocalWindowSelfAttention, self).__init__(init_cfg=init_cfg)
 
@@ -187,6 +193,7 @@ class LocalWindowSelfAttention(BaseModule):
             qk_scale=qk_scale,
             attn_drop_rate=attn_drop_rate,
             proj_drop_rate=proj_drop_rate,
+            with_rpe=with_rpe,
             init_cfg=init_cfg)
 
     def forward(self, x, H, W, **kwargs):
@@ -399,6 +406,7 @@ class HRFomerModule(HRModule):
                  num_mlp_ratios,
                  multiscale_output=True,
                  drop_paths=0.0,
+                 with_rpe=True,
                  conv_cfg=None,
                  norm_cfg=dict(type='SyncBN', requires_grad=True),
                  transformer_norm_cfg=dict(type='LN', eps=1e-6),
@@ -410,6 +418,7 @@ class HRFomerModule(HRModule):
         self.num_heads = num_heads
         self.num_window_sizes = num_window_sizes
         self.num_mlp_ratios = num_mlp_ratios
+        self.with_rpe = with_rpe
 
         super().__init__(num_branches, block, num_blocks, num_inchannels,
                          num_channels, multiscale_output, with_cp, conv_cfg,
@@ -436,7 +445,8 @@ class HRFomerModule(HRModule):
                 drop_path=self.drop_paths[0],
                 norm_cfg=self.norm_cfg,
                 transformer_norm_cfg=self.transformer_norm_cfg,
-                init_cfg=None))
+                init_cfg=None,
+                with_rpe=self.with_rpe))
 
         self.in_channels[
             branch_index] = self.in_channels[branch_index] * block.expansion
@@ -451,7 +461,8 @@ class HRFomerModule(HRModule):
                     drop_path=self.drop_paths[i],
                     norm_cfg=self.norm_cfg,
                     transformer_norm_cfg=self.transformer_norm_cfg,
-                    init_cfg=None))
+                    init_cfg=None,
+                    with_rpe=self.with_rpe))
         return nn.Sequential(*layers)
 
     def _make_fuse_layers(self):
@@ -652,6 +663,7 @@ class HRFormer(HRNet):
         })
         extra['upsample'] = upsample_cfg
         self.transformer_norm_cfg = transformer_norm_cfg
+        self.with_rpe = extra.get('with_rpe', True)
 
         super().__init__(extra, in_channels, conv_cfg, norm_cfg, norm_eval,
                          with_cp, zero_init_residual, frozen_stages)
@@ -692,6 +704,7 @@ class HRFormer(HRNet):
                     reset_multiscale_output,
                     drop_paths=drop_path_rates[num_blocks[0] *
                                                i:num_blocks[0] * (i + 1)],
+                    with_rpe=self.with_rpe,
                     conv_cfg=self.conv_cfg,
                     norm_cfg=self.norm_cfg,
                     transformer_norm_cfg=self.transformer_norm_cfg,
