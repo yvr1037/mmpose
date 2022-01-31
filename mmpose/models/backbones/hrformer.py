@@ -116,7 +116,7 @@ class WindowMSA(BaseModule):
         """
         Args:
 
-            x (tensor): input features with shape of (num_windows*B, N, C)
+            x (tensor): input features with shape of (B*num_windows, N, C)
             mask (tensor | None, Optional): mask with shape of (num_windows,
                 Wh*Ww, Wh*Ww), value should be between (-inf, 0].
         """
@@ -181,10 +181,12 @@ class LocalWindowSelfAttention(BaseModule):
                  attn_drop_rate=0.,
                  proj_drop_rate=0.,
                  with_rpe=True,
+                 with_pad_mask=False,
                  init_cfg=None):
         super(LocalWindowSelfAttention, self).__init__(init_cfg=init_cfg)
 
         self.window_size = window_size
+        self.with_pad_mask = with_pad_mask
         self.attn = WindowMSA(
             embed_dims=embed_dims,
             num_heads=num_heads,
@@ -210,18 +212,39 @@ class LocalWindowSelfAttention(BaseModule):
 
         # permute
         x = x.view(B, math.ceil(H / Wh), Wh, math.ceil(W / Ww), Ww, C)
-        x = x.permute(1, 3, 0, 2, 4, 5)
-        x = x.reshape(-1, Wh * Ww, C)
+        x = x.permute(0, 1, 3, 2, 4, 5)
+        x = x.reshape(-1, Wh * Ww,
+                      C)  # (B*num_window, Wh*Ww, C) ensure batch first
+
+        # x = x.permute(1, 3, 0, 2, 4, 5)
+        # x = x.reshape(-1, Wh * Ww, C)
+
         # x = x.permute(2, 4, 0, 1, 3, 5)
         # x = x.reshape(Wh * Ww, -1, C)
 
         # attention
-        # out = self.attn(x, x, x, **kwargs)
-        out = self.attn(x, **kwargs)
+        if self.with_pad_mask and pad_h > 0 and pad_w > 0:
+            pad_mask = x.new_ones(1, H, W, 1)
+            pad_mask = pad(
+                pad_mask, [
+                    0, 0, pad_w // 2, pad_w - pad_w // 2, pad_h // 2,
+                    pad_h - pad_h // 2
+                ],
+                value=-float('inf'))
+            pad_mask = pad_mask.view(1, math.ceil(H / Wh), Wh,
+                                     math.ceil(W / Ww), Ww, 1)
+            pad_mask = pad_mask.permute(1, 3, 0, 2, 4, 5)
+            pad_mask = pad_mask.reshape(-1, Wh * Ww)
+            pad_mask = pad_mask[:, None, :].expand([-1, Wh * Ww, -1])
+            out = self.attn(x, pad_mask, **kwargs)
+        else:
+            out = self.attn(x, **kwargs)
 
         # reverse permutation
-        out = out.reshape(math.ceil(H / Wh), math.ceil(W / Ww), B, Wh, Ww, C)
-        out = out.permute(2, 0, 3, 1, 4, 5)
+        # out = out.reshape(math.ceil(H / Wh), math.ceil(W / Ww), B, Wh, Ww, C)
+        # out = out.permute(2, 0, 3, 1, 4, 5)
+        out = out.reshape(B, math.ceil(H / Wh), math.ceil(W / Ww), Wh, Ww, C)
+        out = out.permute(0, 1, 3, 2, 4, 5)
         out = out.reshape(B, H + pad_h, W + pad_w, C)
 
         # de-pad
@@ -407,6 +430,7 @@ class HRFomerModule(HRModule):
                  multiscale_output=True,
                  drop_paths=0.0,
                  with_rpe=True,
+                 with_pad_mask=False,
                  conv_cfg=None,
                  norm_cfg=dict(type='SyncBN', requires_grad=True),
                  transformer_norm_cfg=dict(type='LN', eps=1e-6),
@@ -419,6 +443,7 @@ class HRFomerModule(HRModule):
         self.num_window_sizes = num_window_sizes
         self.num_mlp_ratios = num_mlp_ratios
         self.with_rpe = with_rpe
+        self.with_pad_mask = with_pad_mask
 
         super().__init__(num_branches, block, num_blocks, num_inchannels,
                          num_channels, multiscale_output, with_cp, conv_cfg,
@@ -446,7 +471,8 @@ class HRFomerModule(HRModule):
                 norm_cfg=self.norm_cfg,
                 transformer_norm_cfg=self.transformer_norm_cfg,
                 init_cfg=None,
-                with_rpe=self.with_rpe))
+                with_rpe=self.with_rpe,
+                with_pad_mask=self.with_pad_mask))
 
         self.in_channels[
             branch_index] = self.in_channels[branch_index] * block.expansion
@@ -462,7 +488,8 @@ class HRFomerModule(HRModule):
                     norm_cfg=self.norm_cfg,
                     transformer_norm_cfg=self.transformer_norm_cfg,
                     init_cfg=None,
-                    with_rpe=self.with_rpe))
+                    with_rpe=self.with_rpe,
+                    with_pad_mask=self.with_pad_mask))
         return nn.Sequential(*layers)
 
     def _make_fuse_layers(self):
@@ -664,6 +691,7 @@ class HRFormer(HRNet):
         extra['upsample'] = upsample_cfg
         self.transformer_norm_cfg = transformer_norm_cfg
         self.with_rpe = extra.get('with_rpe', True)
+        self.with_pad_mask = extra.get('with_pad_mask', False)
 
         super().__init__(extra, in_channels, conv_cfg, norm_cfg, norm_eval,
                          with_cp, zero_init_residual, frozen_stages)
@@ -705,6 +733,7 @@ class HRFormer(HRNet):
                     drop_paths=drop_path_rates[num_blocks[0] *
                                                i:num_blocks[0] * (i + 1)],
                     with_rpe=self.with_rpe,
+                    with_pad_mask=self.with_pad_mask,
                     conv_cfg=self.conv_cfg,
                     norm_cfg=self.norm_cfg,
                     transformer_norm_cfg=self.transformer_norm_cfg,
